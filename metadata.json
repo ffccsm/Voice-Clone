@@ -1,0 +1,10 @@
+{
+  "name": "VoxClone AI - Neural Voice Studio",
+  "description": "Studio-grade AI voice cloning, acoustic profiling, and expressive speech synthesis powered by Gemini.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
