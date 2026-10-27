@@ -46,6 +46,131 @@ export function fileToBase64(file: Blob): Promise<string> {
 }
 
 /**
+ * Measures the speaker's true Fundamental Frequency (F0 in Hz) from a recorded or uploaded Audio Blob
+ * using time-domain autocorrelation across voiced speech frames.
+ * Male vocal range: ~75Hz - 165Hz | Female vocal range: ~165Hz - 265Hz
+ */
+export async function detectPitchFromAudioBlob(blob: Blob): Promise<{
+  medianF0: number;
+  minF0: number;
+  maxF0: number;
+  detectedGender: "male" | "female";
+  pitchRangeLabel: string;
+  genderClassLabel: string;
+  recommendedMaleOrFemaleAnchor: "Charon" | "Fenrir" | "Puck" | "Kore" | "Zephyr";
+} | null> {
+  try {
+    const arrayBuffer = await blob.arrayBuffer();
+    const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+    const tempCtx = new AudioCtx();
+    const audioBuffer = await tempCtx.decodeAudioData(arrayBuffer);
+    const channelData = audioBuffer.getChannelData(0);
+    const sampleRate = audioBuffer.sampleRate;
+
+    const frameSize = Math.floor(sampleRate * 0.04); // 40ms window
+    const hopSize = Math.floor(sampleRate * 0.02); // 20ms hop
+    const minLag = Math.floor(sampleRate / 300); // Max 300 Hz
+    const maxLag = Math.floor(sampleRate / 65); // Min 65 Hz
+
+    const f0Estimates: number[] = [];
+
+    for (let start = 0; start + frameSize < channelData.length; start += hopSize) {
+      // Compute RMS energy to check if frame is voiced speech
+      let sumSq = 0;
+      for (let i = 0; i < frameSize; i++) {
+        const s = channelData[start + i];
+        sumSq += s * s;
+      }
+      const rms = Math.sqrt(sumSq / frameSize);
+      if (rms < 0.015) continue; // Skip silence/unvoiced frames
+
+      // Normalized autocorrelation within human vocal F0 range (65Hz - 300Hz)
+      let bestLag = -1;
+      let bestCorr = 0;
+
+      for (let lag = minLag; lag <= maxLag && start + lag + frameSize < channelData.length; lag++) {
+        let corr = 0;
+        let normA = 0;
+        let normB = 0;
+        // Subsample by 2 for fast computation
+        for (let i = 0; i < frameSize; i += 2) {
+          const a = channelData[start + i];
+          const b = channelData[start + i + lag];
+          corr += a * b;
+          normA += a * a;
+          normB += b * b;
+        }
+        const denom = Math.sqrt(normA * normB);
+        const normalized = denom > 0 ? corr / denom : 0;
+        if (normalized > bestCorr) {
+          bestCorr = normalized;
+          bestLag = lag;
+        }
+      }
+
+      if (bestLag > 0 && bestCorr > 0.55) {
+        const f0 = sampleRate / bestLag;
+        if (f0 >= 70 && f0 <= 290) {
+          f0Estimates.push(f0);
+        }
+      }
+    }
+
+    await tempCtx.close().catch(() => {});
+
+    if (f0Estimates.length === 0) {
+      return null;
+    }
+
+    f0Estimates.sort((a, b) => a - b);
+    const p15 = Math.round(f0Estimates[Math.floor(f0Estimates.length * 0.15)]);
+    const medianF0 = Math.round(f0Estimates[Math.floor(f0Estimates.length * 0.5)]);
+    const p85 = Math.round(f0Estimates[Math.floor(f0Estimates.length * 0.85)]);
+
+    const minF0 = Math.max(70, Math.min(p15, medianF0 - 15));
+    const maxF0 = Math.min(285, Math.max(p85, medianF0 + 20));
+    const detectedGender: "male" | "female" = medianF0 < 165 ? "male" : "female";
+
+    let genderClassLabel = "Male Baritone";
+    let recommendedMaleOrFemaleAnchor: "Charon" | "Fenrir" | "Puck" | "Kore" | "Zephyr" = "Charon";
+
+    if (detectedGender === "male") {
+      if (medianF0 < 108) {
+        genderClassLabel = "Deep Male Bass-Baritone";
+        recommendedMaleOrFemaleAnchor = "Fenrir";
+      } else if (medianF0 <= 140) {
+        genderClassLabel = "Male Baritone";
+        recommendedMaleOrFemaleAnchor = "Charon";
+      } else {
+        genderClassLabel = "Male Tenor";
+        recommendedMaleOrFemaleAnchor = "Puck";
+      }
+    } else {
+      if (medianF0 < 205) {
+        genderClassLabel = "Female Contralto / Mezzo";
+        recommendedMaleOrFemaleAnchor = "Kore";
+      } else {
+        genderClassLabel = "Female Mezzo-Soprano";
+        recommendedMaleOrFemaleAnchor = "Zephyr";
+      }
+    }
+
+    return {
+      medianF0,
+      minF0,
+      maxF0,
+      detectedGender,
+      pitchRangeLabel: `${minF0}Hz - ${maxF0}Hz`,
+      genderClassLabel,
+      recommendedMaleOrFemaleAnchor,
+    };
+  } catch (e) {
+    console.warn("Pitch detection fallback:", e);
+    return null;
+  }
+}
+
+/**
  * Draw animated dynamic waveform on canvas
  */
 export function drawVisualizer(
@@ -102,7 +227,7 @@ export function drawVisualizer(
       analyser.getByteFrequencyData(dataArray);
 
       const barCount = 36;
-      const barWidth = (width / barCount) - 3;
+      const barWidth = width / barCount - 3;
       const step = Math.floor(bufferLength / barCount);
 
       for (let i = 0; i < barCount; i++) {

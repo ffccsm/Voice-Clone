@@ -14,8 +14,22 @@ export default function App() {
     try {
       const saved = localStorage.getItem("voxclone_custom_profiles");
       if (saved) {
-        const parsed = JSON.parse(saved);
-        return [...parsed, ...PRESET_VOICES];
+        const parsed: VoiceCloneProfile[] = JSON.parse(saved);
+        const migrated = parsed.map((p) => {
+          const isExplicitlyFemale = /female|soprano|contralto|woman/i.test(p.genderClass || "");
+          if (!isExplicitlyFemale && (p.recommendedBaseVoice === "Kore" || p.recommendedBaseVoice === "Zephyr")) {
+            return {
+              ...p,
+              recommendedBaseVoice: "Charon" as const,
+              genderClass: /male|baritone|tenor|bass/i.test(p.genderClass || "")
+                ? p.genderClass
+                : "Male Baritone",
+            };
+          }
+          return p;
+        });
+        localStorage.setItem("voxclone_custom_profiles", JSON.stringify(migrated));
+        return [...migrated, ...PRESET_VOICES];
       }
     } catch (e) {
       console.warn("Could not read saved custom profiles", e);
@@ -23,7 +37,7 @@ export default function App() {
     return PRESET_VOICES;
   });
 
-  const [selectedVoice, setSelectedVoice] = useState<VoiceCloneProfile>(PRESET_VOICES[0]);
+  const [selectedVoice, setSelectedVoice] = useState<VoiceCloneProfile>(() => voices[0] || PRESET_VOICES[0]);
   const [latestAudio, setLatestAudio] = useState<SynthesizedAudio | null>(null);
 
   // Sync custom profiles to localStorage
@@ -38,7 +52,10 @@ export default function App() {
 
   const handleCloneComplete = (newProfile: VoiceCloneProfile) => {
     setVoices((prev) => {
-      const updated = [newProfile, ...prev];
+      const exists = prev.some((v) => v.id === newProfile.id);
+      const updated = exists
+        ? prev.map((v) => (v.id === newProfile.id ? newProfile : v))
+        : [newProfile, ...prev];
       saveCustomProfiles(updated);
       return updated;
     });
@@ -86,6 +103,7 @@ export default function App() {
             voices={voices}
             selectedVoice={selectedVoice}
             onSelectVoice={setSelectedVoice}
+            onUpdateVoice={handleCloneComplete}
             onOpenComparison={handleOpenComparison}
           />
         )}

@@ -19,11 +19,13 @@ import {
 } from "lucide-react";
 import { VoiceCloneProfile, SynthesizedAudio, ScriptSuggestion } from "../types/voice";
 import { getAudioContext, drawVisualizer, base64ToBlobUrl } from "../utils/audioEngine";
+import { apiPost } from "../utils/apiClient";
 
 interface StudioSynthesizerProps {
   voices: VoiceCloneProfile[];
   selectedVoice: VoiceCloneProfile;
   onSelectVoice: (voice: VoiceCloneProfile) => void;
+  onUpdateVoice?: (voice: VoiceCloneProfile) => void;
   onOpenComparison: (profile: VoiceCloneProfile, audio: SynthesizedAudio) => void;
 }
 
@@ -31,6 +33,7 @@ export const StudioSynthesizer: React.FC<StudioSynthesizerProps> = ({
   voices,
   selectedVoice,
   onSelectVoice,
+  onUpdateVoice,
   onOpenComparison,
 }) => {
   // Synthesis Input
@@ -38,6 +41,9 @@ export const StudioSynthesizer: React.FC<StudioSynthesizerProps> = ({
     "Welcome to VoxClone AI. This synthetic voice was generated from neural acoustic profiling, capturing our timbre, pacing, and cadence with lifelike expression."
   );
   const [stylePrompt, setStylePrompt] = useState<string>(selectedVoice.stylePrompt);
+  const [activeBaseVoice, setActiveBaseVoice] = useState<VoiceCloneProfile["recommendedBaseVoice"]>(
+    selectedVoice.recommendedBaseVoice || "Charon"
+  );
   const [selectedModel, setSelectedModel] = useState<"gemini-3.8-flash-tts" | "gemini-3.8-flash-lite-tts">(
     "gemini-3.8-flash-tts"
   );
@@ -47,7 +53,7 @@ export const StudioSynthesizer: React.FC<StudioSynthesizerProps> = ({
   const [bassBoost, setBassBoost] = useState<number>(
     selectedVoice.tuningRecommendations?.bassBoostDb || 1.5
   );
-  const [showAdvancedTuning, setShowAdvancedTuning] = useState<boolean>(false);
+  const [showAdvancedTuning, setShowAdvancedTuning] = useState<boolean>(true);
 
   // Script suggestions state
   const [isGeneratingScripts, setIsGeneratingScripts] = useState<boolean>(false);
@@ -74,14 +80,46 @@ export const StudioSynthesizer: React.FC<StudioSynthesizerProps> = ({
   const bassFilterNodeRef = useRef<BiquadFilterNode | null>(null);
   const cleanupVisualizerRef = useRef<(() => void) | null>(null);
 
-  // Update style prompt when selected voice changes
+  // Update style prompt and base voice when selected voice changes
   useEffect(() => {
     setStylePrompt(selectedVoice.stylePrompt);
+    setActiveBaseVoice(selectedVoice.recommendedBaseVoice || "Charon");
     if (selectedVoice.tuningRecommendations) {
       setPlaybackRate(selectedVoice.tuningRecommendations.recommendedPlaybackRate || 1.0);
       setBassBoost(selectedVoice.tuningRecommendations.bassBoostDb || 1.0);
     }
-  }, [selectedVoice.id]);
+  }, [selectedVoice.id, selectedVoice.recommendedBaseVoice]);
+
+  const handleAnchorChange = (newAnchor: VoiceCloneProfile["recommendedBaseVoice"]) => {
+    setActiveBaseVoice(newAnchor);
+    const isMale = ["Charon", "Fenrir", "Puck"].includes(newAnchor);
+    let updatedPrompt = stylePrompt;
+    if (isMale && /female|feminine|soprano|contralto/i.test(updatedPrompt)) {
+      updatedPrompt =
+        "Natural masculine male voice with warm chest resonance, clear articulation, and balanced conversational cadence.";
+      setStylePrompt(updatedPrompt);
+    } else if (!isMale && /\bmale\b|masculine|baritone|bass/i.test(updatedPrompt)) {
+      updatedPrompt =
+        "Natural warm female voice with expressive clarity, smooth resonance, and balanced conversational cadence.";
+      setStylePrompt(updatedPrompt);
+    }
+    if (onUpdateVoice && !selectedVoice.isPreset) {
+      onUpdateVoice({
+        ...selectedVoice,
+        recommendedBaseVoice: newAnchor,
+        genderClass: isMale
+          ? newAnchor === "Fenrir"
+            ? "Deep Male Bass-Baritone"
+            : newAnchor === "Puck"
+            ? "Male Tenor"
+            : "Male Baritone"
+          : newAnchor === "Zephyr"
+          ? "Female Mezzo-Soprano"
+          : "Female Contralto",
+        stylePrompt: updatedPrompt,
+      });
+    }
+  };
 
   // Audio element listeners
   useEffect(() => {
@@ -170,23 +208,13 @@ export const StudioSynthesizer: React.FC<StudioSynthesizerProps> = ({
     setSynthesisError(null);
 
     try {
-      const response = await fetch("/api/clone/synthesize", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: inputText,
-          baseVoice: selectedVoice.recommendedBaseVoice || "Charon",
-          stylePrompt: stylePrompt || selectedVoice.stylePrompt,
-          model: selectedModel,
-        }),
+      const data = await apiPost<{ audioBase64: string }>("/api/clone/synthesize", {
+        text: inputText,
+        baseVoice: activeBaseVoice || selectedVoice.recommendedBaseVoice || "Charon",
+        stylePrompt: stylePrompt || selectedVoice.stylePrompt,
+        model: selectedModel,
       });
 
-      if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.error || "Speech synthesis failed");
-      }
-
-      const data = await response.json();
       const blobUrl = base64ToBlobUrl(data.audioBase64, "audio/wav");
 
       const newAudio: SynthesizedAudio = {
@@ -198,7 +226,7 @@ export const StudioSynthesizer: React.FC<StudioSynthesizerProps> = ({
         audioUrl: blobUrl,
         timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
         stylePrompt: stylePrompt,
-        baseVoice: selectedVoice.recommendedBaseVoice,
+        baseVoice: activeBaseVoice,
         model: selectedModel,
       };
 
@@ -244,15 +272,10 @@ export const StudioSynthesizer: React.FC<StudioSynthesizerProps> = ({
     setIsGeneratingScripts(true);
     setShowScriptModal(true);
     try {
-      const res = await fetch("/api/clone/script-suggest", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ profile: selectedVoice }),
+      const data = await apiPost<{ scripts: ScriptSuggestion[] }>("/api/clone/script-suggest", {
+        profile: selectedVoice,
       });
-      if (res.ok) {
-        const data = await res.json();
-        setScriptSuggestions(data.scripts || []);
-      }
+      setScriptSuggestions(data.scripts || []);
     } catch (e) {
       console.error("Failed to generate scripts", e);
     } finally {
@@ -675,6 +698,83 @@ export const StudioSynthesizer: React.FC<StudioSynthesizerProps> = ({
               />
             </div>
 
+            {/* Voice Gender & Neural Base Voice Selector */}
+            <div className="space-y-2 pt-1">
+              <div className="flex items-center justify-between text-xs">
+                <label className="text-slate-300 font-semibold">
+                  Voice Gender & Neural Anchor:
+                </label>
+                <span
+                  className={`text-[10px] font-bold px-2 py-0.5 rounded border ${
+                    ["Charon", "Fenrir", "Puck"].includes(activeBaseVoice)
+                      ? "bg-cyan-950/80 text-cyan-300 border-cyan-800"
+                      : "bg-fuchsia-950/80 text-fuchsia-300 border-fuchsia-800"
+                  }`}
+                >
+                  {["Charon", "Fenrir", "Puck"].includes(activeBaseVoice)
+                    ? `Male (${activeBaseVoice})`
+                    : `Female (${activeBaseVoice})`}
+                </span>
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="text-[10px] uppercase tracking-wider text-slate-400 font-bold">
+                  Male Voice Anchors
+                </div>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {(
+                    [
+                      { id: "Charon", label: "Charon", desc: "Deep Male" },
+                      { id: "Fenrir", label: "Fenrir", desc: "Rugged Male" },
+                      { id: "Puck", label: "Puck", desc: "Tenor Male" },
+                    ] as const
+                  ).map((v) => (
+                    <button
+                      key={v.id}
+                      type="button"
+                      onClick={() => handleAnchorChange(v.id)}
+                      className={`p-2 rounded-xl border text-left transition-all cursor-pointer ${
+                        activeBaseVoice === v.id
+                          ? "bg-cyan-950/80 border-cyan-400 text-white shadow-sm shadow-cyan-500/20"
+                          : "bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700"
+                      }`}
+                    >
+                      <div className="text-xs font-bold text-white">{v.label}</div>
+                      <div className="text-[10px] text-cyan-400">{v.desc}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="space-y-1.5 pt-1">
+                <div className="text-[10px] uppercase tracking-wider text-slate-400 font-bold">
+                  Female Voice Anchors
+                </div>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {(
+                    [
+                      { id: "Kore", label: "Kore", desc: "Warm Female" },
+                      { id: "Zephyr", label: "Zephyr", desc: "Crisp Female" },
+                    ] as const
+                  ).map((v) => (
+                    <button
+                      key={v.id}
+                      type="button"
+                      onClick={() => handleAnchorChange(v.id)}
+                      className={`p-2 rounded-xl border text-left transition-all cursor-pointer ${
+                        activeBaseVoice === v.id
+                          ? "bg-fuchsia-950/80 border-fuchsia-400 text-white shadow-sm shadow-fuchsia-500/20"
+                          : "bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700"
+                      }`}
+                    >
+                      <div className="text-xs font-bold text-white">{v.label}</div>
+                      <div className="text-[10px] text-fuchsia-400">{v.desc}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
             {/* Advanced EQ & Playback Sliders */}
             {showAdvancedTuning && (
               <div className="space-y-4 pt-2 border-t border-slate-800 animate-in fade-in">
@@ -693,14 +793,6 @@ export const StudioSynthesizer: React.FC<StudioSynthesizerProps> = ({
                     onChange={(e) => setBassBoost(parseFloat(e.target.value))}
                     className="w-full accent-cyan-400 cursor-pointer h-1.5 bg-slate-800 rounded-lg appearance-none"
                   />
-                </div>
-
-                {/* Prebuilt Anchor Voice */}
-                <div className="p-3 bg-slate-950 rounded-xl border border-slate-800 flex items-center justify-between text-xs">
-                  <span className="text-slate-400">Underlying Neural Anchor Voice:</span>
-                  <span className="font-bold text-indigo-400 bg-indigo-950 px-2.5 py-0.5 rounded border border-indigo-800">
-                    {selectedVoice.recommendedBaseVoice}
-                  </span>
                 </div>
               </div>
             )}

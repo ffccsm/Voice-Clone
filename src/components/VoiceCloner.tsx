@@ -22,7 +22,9 @@ import {
   drawVisualizer,
   calculateDecibels,
   fileToBase64,
+  detectPitchFromAudioBlob,
 } from "../utils/audioEngine";
+import { apiPost } from "../utils/apiClient";
 
 interface VoiceClonerProps {
   onCloneComplete: (profile: VoiceCloneProfile) => void;
@@ -60,6 +62,13 @@ export const VoiceCloner: React.FC<VoiceClonerProps> = ({
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [clonedProfile, setClonedProfile] = useState<VoiceCloneProfile | null>(null);
   const [customCloneName, setCustomCloneName] = useState<string>("");
+  const [genderHint, setGenderHint] = useState<"auto" | "male" | "female">("male");
+  const [detectedPitch, setDetectedPitch] = useState<{
+    medianF0: number;
+    pitchRangeLabel: string;
+    detectedGender: "male" | "female";
+    genderClassLabel: string;
+  } | null>(null);
 
   // MediaRecorder & AudioContext refs
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -141,12 +150,12 @@ export const VoiceCloner: React.FC<VoiceClonerProps> = ({
       }, 80);
 
       // MediaRecorder configuration
-      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+      const recorderMimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
         ? "audio/webm;codecs=opus"
         : "audio/webm";
-      setAudioMimeType(mimeType);
+      setAudioMimeType("audio/webm");
 
-      const recorder = new MediaRecorder(stream, { mimeType });
+      const recorder = new MediaRecorder(stream, { mimeType: recorderMimeType });
       mediaRecorderRef.current = recorder;
 
       recorder.ondataavailable = (event) => {
@@ -156,7 +165,7 @@ export const VoiceCloner: React.FC<VoiceClonerProps> = ({
       };
 
       recorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
+        const audioBlob = new Blob(audioChunksRef.current, { type: "audio/webm" });
         const url = URL.createObjectURL(audioBlob);
         setRecordedAudioUrl(url);
 
@@ -164,6 +173,12 @@ export const VoiceCloner: React.FC<VoiceClonerProps> = ({
         setAudioBase64(b64);
         setIsRecording(false);
         stopRecordingCleanup();
+
+        const pitchInfo = await detectPitchFromAudioBlob(audioBlob);
+        if (pitchInfo) {
+          setDetectedPitch(pitchInfo);
+          setGenderHint(pitchInfo.detectedGender);
+        }
       };
 
       recorder.start(100);
@@ -206,6 +221,11 @@ export const VoiceCloner: React.FC<VoiceClonerProps> = ({
       const b64 = await fileToBase64(file);
       setAudioBase64(b64);
       setAnalysisError(null);
+      const pitchInfo = await detectPitchFromAudioBlob(file);
+      if (pitchInfo) {
+        setDetectedPitch(pitchInfo);
+        setGenderHint(pitchInfo.detectedGender);
+      }
     } catch (err) {
       setAnalysisError("Failed to read audio file");
     }
@@ -221,7 +241,7 @@ export const VoiceCloner: React.FC<VoiceClonerProps> = ({
 
     try {
       setAnalysisStep("Decomposing harmonic frequencies and pitch baseline...");
-      await new Promise((r) => setTimeout(r, 600));
+      await new Promise((r) => setTimeout(r, 400));
 
       setAnalysisStep("Evaluating vocal tract resonance & cadence markers...");
 
@@ -229,23 +249,16 @@ export const VoiceCloner: React.FC<VoiceClonerProps> = ({
         customCloneName.trim() ||
         (sourceType === "record" ? "My Cloned Voice" : uploadedFileName || "Imported Voice");
 
-      const response = await fetch("/api/clone/analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          audioData: audioBase64,
-          mimeType: audioMimeType,
-          sampleName: sampleTitle,
-        }),
+      const data = await apiPost<{ profile: VoiceCloneProfile }>("/api/clone/analyze", {
+        audioData: audioBase64,
+        mimeType: (audioMimeType || "audio/webm").split(";")[0].trim(),
+        sampleName: sampleTitle,
+        genderHint,
+        measuredPitchHz: detectedPitch?.medianF0,
+        pitchRangeLabel: detectedPitch?.pitchRangeLabel,
       });
 
-      if (!response.ok) {
-        const errJson = await response.json();
-        throw new Error(errJson.error || "Neural acoustic analysis failed");
-      }
-
       setAnalysisStep("Synthesizing neural style directive & anchor mapping...");
-      const data = await response.json();
 
       if (data.profile) {
         const fullProfile: VoiceCloneProfile = {
@@ -551,6 +564,57 @@ export const VoiceCloner: React.FC<VoiceClonerProps> = ({
                 className="hidden"
               />
 
+              {/* Voice Gender Target & DSP Pitch Readout */}
+              <div className="bg-slate-950/90 border border-slate-800 rounded-xl p-3.5 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <span className="font-semibold text-slate-300">
+                    Target Voice Gender & Anchor Pool:
+                  </span>
+                  {detectedPitch && (
+                    <span className="font-mono text-[11px] px-2 py-0.5 rounded bg-cyan-950/80 text-cyan-300 border border-cyan-800/60">
+                      Measured F0: ~{detectedPitch.medianF0} Hz ({detectedPitch.pitchRangeLabel}) •{" "}
+                      {detectedPitch.genderClassLabel}
+                    </span>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-3 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setGenderHint("male")}
+                    className={`py-2 px-3 rounded-lg border text-xs font-bold transition-all cursor-pointer ${
+                      genderHint === "male"
+                        ? "bg-cyan-500 text-slate-950 border-cyan-400 shadow-md shadow-cyan-500/20"
+                        : "bg-slate-900 border-slate-800 text-slate-400 hover:text-white"
+                    }`}
+                  >
+                    Male Voice (Charon / Fenrir / Puck)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setGenderHint("female")}
+                    className={`py-2 px-3 rounded-lg border text-xs font-bold transition-all cursor-pointer ${
+                      genderHint === "female"
+                        ? "bg-cyan-500 text-slate-950 border-cyan-400 shadow-md shadow-cyan-500/20"
+                        : "bg-slate-900 border-slate-800 text-slate-400 hover:text-white"
+                    }`}
+                  >
+                    Female Voice (Kore / Zephyr)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setGenderHint("auto")}
+                    className={`py-2 px-3 rounded-lg border text-xs font-bold transition-all cursor-pointer ${
+                      genderHint === "auto"
+                        ? "bg-cyan-500 text-slate-950 border-cyan-400 shadow-md shadow-cyan-500/20"
+                        : "bg-slate-900 border-slate-800 text-slate-400 hover:text-white"
+                    }`}
+                  >
+                    Auto-Detect (DSP Pitch)
+                  </button>
+                </div>
+              </div>
+
               <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
                 <button
                   onClick={togglePlayPreview}
@@ -662,10 +726,43 @@ export const VoiceCloner: React.FC<VoiceClonerProps> = ({
                     </p>
                   </div>
                   <div className="text-right">
-                    <div className="text-[10px] uppercase tracking-wider text-slate-400">Anchor</div>
-                    <div className="text-xs font-bold text-indigo-300 bg-indigo-950/80 px-2 py-0.5 rounded border border-indigo-800">
-                      {clonedProfile.recommendedBaseVoice}
+                    <div className="text-[10px] uppercase tracking-wider text-slate-400 mb-1">
+                      Neural Anchor
                     </div>
+                    <select
+                      value={clonedProfile.recommendedBaseVoice}
+                      onChange={(e) => {
+                        const newAnchor = e.target.value as VoiceCloneProfile["recommendedBaseVoice"];
+                        const isMale = ["Charon", "Fenrir", "Puck"].includes(newAnchor);
+                        const updated: VoiceCloneProfile = {
+                          ...clonedProfile,
+                          recommendedBaseVoice: newAnchor,
+                          genderClass: isMale
+                            ? newAnchor === "Fenrir"
+                              ? "Deep Male Bass-Baritone"
+                              : newAnchor === "Puck"
+                              ? "Male Tenor"
+                              : "Male Baritone"
+                            : newAnchor === "Zephyr"
+                            ? "Female Mezzo-Soprano"
+                            : "Female Contralto",
+                          avatarColor: getDynamicAvatarGradient(newAnchor),
+                        };
+                        setClonedProfile(updated);
+                        onCloneComplete(updated);
+                      }}
+                      className="text-xs font-bold text-indigo-200 bg-indigo-950/90 px-2.5 py-1 rounded-lg border border-indigo-700 outline-none cursor-pointer"
+                    >
+                      <optgroup label="Male Neural Anchors">
+                        <option value="Charon">Charon (Deep Male)</option>
+                        <option value="Fenrir">Fenrir (Rugged Male)</option>
+                        <option value="Puck">Puck (Tenor Male)</option>
+                      </optgroup>
+                      <optgroup label="Female Neural Anchors">
+                        <option value="Kore">Kore (Warm Female)</option>
+                        <option value="Zephyr">Zephyr (Crisp Female)</option>
+                      </optgroup>
+                    </select>
                   </div>
                 </div>
 
